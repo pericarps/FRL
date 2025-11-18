@@ -1,234 +1,128 @@
-import math
-from typing import Dict, List, Tuple
-import numpy as np
+# federated_learning.py
 import torch
+import copy
+from typing import List, Dict, Optional
+from agent import DoubleDQNAgent
 
-from model import DQNAgent
-from util import aggregate_gradients
-
-
-def _rdp_gaussian_subsampled(alpha: float, q: float, z: float) -> float:
-    """
-    采样高斯机制 RDP 小 q 近似：eps_alpha ≈ q^2 * alpha / (2 z^2)
-    为防守性，我们再乘以一个系数 k<=1 以缓和消耗（可视为经验近似的保守修正）。
-    """
-    q = min(max(q, 1e-8), 0.1)  # 上限降低至 0.1，更贴近经验回放的小采样率
-    k = 0.8  # 缓和系数，经验值
-    return k * (q * q) * alpha / max(2.0 * (z ** 2), 1e-12)
-
-
-class VehicleClient:
-    """
-    DP-SGD 均值梯度噪声：
-    - 正常模式：sigma_mean = z * C / batch
-    - 低预算模式：sigma_mean = z_min * C / batch，优化器 lr 衰减到 10%
-    - 真正冻结：仅当 remain_eps<=0 且 eps_equiv 超过总预算（极端情况）
-    """
-    def __init__(
-        self,
-        vid: int,
-        agent: DQNAgent,
-        clip_C: float,
-        alpha_rdp: float,
-        delta: float,
-        init_eps: float,
-        device: str = "cpu",
-        z_init: float = 1.0,
-        z_min: float = 0.5,
-        z_max: float = 2.0,
-        low_eps_threshold: float = 0.2,  # 低预算阈值（相对单车预算）
-        freeze_when_exhausted: bool = True,
-    ):
-        self.vid = vid
-        self.agent = agent
-        self.clip_C = clip_C
-        self.alpha_rdp = alpha_rdp
-        self.delta = delta
-        self.total_eps_budget = init_eps
-        self.remain_eps = init_eps
-        self.device = device
-
-        self.rdp_alpha_total = 0.0
-
-        self.z = z_init
-        self.z_min = z_min
-        self.z_max = z_max
-
-        self.low_eps_threshold = low_eps_threshold
-        self.freeze_when_exhausted = freeze_when_exhausted
-
-        self.last_sigma = 0.0
-        self.last_eps_equiv = 0.0
-        self.last_frozen = 0
-        self.low_eps_mode = 0
-
-    def _eps_from_rdp(self, eps_alpha_total: float) -> float:
-        return eps_alpha_total + (math.log(1.0 / max(self.delta, 1e-12)) / (self.alpha_rdp - 1.0))
-
-    def local_update_with_dp(self, loss: torch.Tensor, batch_size: int, buffer_len: int) -> Dict[str, float]:
-        stats = {"sigma": 0.0, "eps_rdp_total": self.rdp_alpha_total, "eps_remain": self.remain_eps, "frozen": 0, "low_eps": 0}
-
-        # 判断是否进入低预算模式或冻结
-        low_eps = (self.remain_eps <= self.low_eps_threshold)
-        self.low_eps_mode = 1 if low_eps else 0
-
-        # 计算噪声标准差（均值梯度）
-        if low_eps:
-            sigma_mean = self.z_min * self.clip_C / max(1, batch_size)
-        else:
-            sigma_mean = self.z * self.clip_C / max(1, batch_size)
-
-        # 是否完全冻结（仅在预算彻底耗尽且需要严格停止时）
-        should_freeze = (self.remain_eps <= 0.0) and self.freeze_when_exhausted
-        if should_freeze:
-            self.last_sigma = 0.0
-            self.last_frozen = 1
-            stats.update({"sigma": 0.0, "eps_rdp_total": self.rdp_alpha_total,
-                          "eps_remain": self.remain_eps, "frozen": 1, "low_eps": self.low_eps_mode})
-            return stats
-
-        # 一步 DP-SGD
-        self.agent.optimizer.zero_grad()
-        loss.backward()
-
-        # Clip + noise
-        total_norm_sq = 0.0
-        for p in self.agent.q_net.parameters():
-            if p.grad is not None:
-                total_norm_sq += p.grad.data.norm(2).item() ** 2
-        total_norm = math.sqrt(total_norm_sq) + 1e-12
-        clip_coef = min(1.0, self.clip_C / total_norm)
-        for p in self.agent.q_net.parameters():
-            if p.grad is None:
-                continue
-            p.grad.data.mul_(clip_coef)
-            if sigma_mean > 0:
-                p.grad.data.add_(torch.randn_like(p.grad.data) * sigma_mean)
-
-        # 低预算模式下，学习率衰减到 10%
-        if low_eps:
-            for g in self.agent.optimizer.param_groups:
-                base_lr = g.get('initial_lr', g['lr'])
-                g['lr'] = base_lr * 0.1
-        self.agent.optimizer.step()
-        # 恢复 lr
-        for g in self.agent.optimizer.param_groups:
-            base_lr = g.get('initial_lr', g['lr'])
-            g['lr'] = base_lr
-
-        # RDP 会计
-        q = min(0.1, max(batch_size, 1) / max(buffer_len, batch_size))
-        z_eff = self.z_min if low_eps else self.z
-        eps_alpha_step = _rdp_gaussian_subsampled(self.alpha_rdp, q, z_eff)
-        self.rdp_alpha_total += eps_alpha_step
-
-        eps_equiv = self._eps_from_rdp(self.rdp_alpha_total)
-        eps_consumed = max(0.0, eps_equiv - self.last_eps_equiv if hasattr(self, "last_eps_equiv") else eps_equiv)
-        self.remain_eps = max(0.0, self.remain_eps - eps_consumed)
-        self.last_eps_equiv = eps_equiv
-
-        # 自适应 z（仅在正常模式才增大）
-        if not low_eps:
-            if eps_consumed > 0.01:
-                self.z = min(self.z_max, self.z * 1.05)
-            else:
-                self.z = max(self.z_min, self.z * 0.995)
-
-        self.last_sigma = float(sigma_mean)
-        self.last_frozen = 0
-        stats.update({
-            "sigma": self.last_sigma,
-            "eps_rdp_total": self.rdp_alpha_total,
-            "eps_remain": self.remain_eps,
-            "frozen": 0,
-            "low_eps": self.low_eps_mode
-        })
-        return stats
-
-
-class RSUServer:
-    def __init__(self, rid: int):
-        self.rid = rid
-
-    @torch.no_grad()
-    def aggregate(self, client_state_dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        return aggregate_gradients(client_state_dicts)
-
-
-class BaseStation:
-    def __init__(self):
-        pass
-
-    @torch.no_grad()
-    def global_aggregate(self, rsu_state_dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        return aggregate_gradients(rsu_state_dicts)
-
-
-class PrivacyBudgetAllocator:
-    def __init__(self, total_eps: float, num_tasks: int, task_weights: List[float], num_vehicles: int):
-        self.total_eps = total_eps
-        self.num_tasks = num_tasks
-        self.task_weights = np.array(task_weights, dtype=np.float64)
+class HierFL:
+    def __init__(self, 
+                 num_vehicles: int, 
+                 device: str = 'cpu', 
+                 num_rsus: int = 2):
         self.num_vehicles = num_vehicles
-        self.eps_task = np.zeros(num_tasks, dtype=np.float64)
-        self.eps_vehicle_task = np.zeros((num_vehicles, num_tasks), dtype=np.float64)
-        self.used = np.zeros(num_tasks, dtype=np.float64)
-        self.reset()
+        self.device = device
+        self.global_model = None
+        self.num_rsus = max(1, int(num_rsus))
+        self.rsu_members: Dict[int, List[int]] = {i: [] for i in range(self.num_rsus)}
+        for vid in range(num_vehicles):
+            rsu_id = vid % self.num_rsus
+            self.rsu_members[rsu_id].append(vid)
+        self.rsu_models: Dict[int, torch.nn.Module] = {}
 
-    def reset(self):
-        wsum = np.sum(self.task_weights) + 1e-12
-        for i in range(self.num_tasks):
-            self.eps_task[i] = self.total_eps * (self.task_weights[i] / wsum)
-        for v in range(self.num_vehicles):
-            self.eps_vehicle_task[v, :] = self.eps_task[:] / max(1, self.num_vehicles)
-        self.used[:] = 0.0
+    def set_global_model(self, agent: DoubleDQNAgent):
+        # 处理 Opacus GradSampleModule 包装
+        # GradSampleModule 包装后，原始模型在 ._module 属性中
+        if hasattr(agent.q_network, '_module'):
+            # Opacus wrapped: q_network._module 就是 FusedQNetwork
+            self.global_model = copy.deepcopy(agent.q_network._module)
+        else:
+            # Not wrapped: q_network 就是 FusedQNetwork
+            self.global_model = copy.deepcopy(agent.q_network)
+        self.global_model.eval()
 
-    def consume(self, task_id: int, eps_used: float):
-        self.used[task_id] += eps_used
-        self.used[task_id] = min(self.used[task_id], self.eps_task[task_id])
+        self.rsu_models = {
+            rsu_id: copy.deepcopy(self.global_model).eval() for rsu_id in self.rsu_members.keys()
+        }
 
-    def dynamic_redistribute(self, completed: List[int]):
-        unused = 0.0
-        for i in completed:
-            unused += max(0.0, self.eps_task[i] - self.used[i])
-            self.eps_task[i] = self.used[i]
-        remaining = [i for i in range(self.num_tasks) if i not in completed]
-        if not remaining or unused <= 0:
+    def _fedavg_state_dict(self, models: List[torch.nn.Module]) -> Dict:
+        """
+        联邦平均：对多个模型的参数求平均
+        处理 Opacus GradSampleModule 包装的情况
+        """
+        assert len(models) > 0
+        first_sd = models[0].state_dict()
+        keys = first_sd.keys()
+        # 检查是否是 Opacus 包装的模型（key 以 _module. 开头）
+        is_wrapped = any(k.startswith('_module.') for k in keys)
+        
+        # 对所有模型的参数求平均
+        out = {}
+        for k in keys:
+            out[k] = torch.stack([m.state_dict()[k].float() for m in models], dim=0).mean(dim=0)
+
+        # 如果是包装的，移除 _module. 前缀
+        if is_wrapped:
+            clean_out = {}
+            for k, v in out.items():
+                if k.startswith('_module.'):
+                    clean_key = k.replace('_module.', '')
+                    clean_out[clean_key] = v
+                else:
+                    clean_out[k] = v
+            return clean_out
+        return out
+
+    def aggregate_models(self, agents: List[DoubleDQNAgent]):  
+        """聚合所有agent的critic模型（仅DDQN，不包含transformer）"""
+        if self.global_model is None:
+            self.set_global_model(agents[0])
             return
-        w = self.task_weights[remaining]
-        wsum = np.sum(w) + 1e-12
-        for i in remaining:
-            self.eps_task[i] += unused * (self.task_weights[i] / wsum)
-        for v in range(self.num_vehicles):
-            self.eps_vehicle_task[v, remaining] = self.eps_task[remaining] / max(1, self.num_vehicles)
 
-    def get_vehicle_task_budget(self, v: int, task_id: int) -> float:
-        return float(self.eps_vehicle_task[v, task_id])
+        # RSU级别聚合
+        for rsu_id, members in self.rsu_members.items():
+            if not members:
+                continue
+            local_models = [agents[i].q_network for i in members]
+            agg_sd = self._fedavg_state_dict(local_models)
+            self.rsu_models[rsu_id].load_state_dict(agg_sd)
+            
+        # 全局聚合
+        rsu_model_list = [self.rsu_models[rid] for rid in sorted(self.rsu_models.keys()) if self.rsu_members[rid]]
+        if rsu_model_list:
+            global_sd = self._fedavg_state_dict(rsu_model_list)
+            self.global_model.load_state_dict(global_sd)
 
-    def get_task_remaining(self, task_id: int) -> float:
-        return max(0.0, float(self.eps_task[task_id] - self.used[task_id]))
+    def distribute_model(self, agents: List[DoubleDQNAgent]):
+        """
+        将全局critic模型分发到各个agent（仅DDQN，不包含transformer）
+        处理 Opacus GradSampleModule 包装的情况
+        """
+        if self.global_model is None:
+            return
+        for rsu_id, members in self.rsu_members.items():
+            src_model = self.rsu_models.get(rsu_id, self.global_model)
+            sd = src_model.state_dict()
+            for vid in members:
+                agent = agents[vid]
+                # 如果 q_network 是 Opacus 包装的，需要添加 _module. 前缀
+                if hasattr(agent.q_network, '_module'):
+                    sd_with_prefix = {}
+                    for k, v in sd.items():
+                        sd_with_prefix[f'_module.{k}'] = v
+                    agent.q_network.load_state_dict(sd_with_prefix)
+                    # target_network 没有包装，直接加载
+                    agent.target_network.load_state_dict(sd)
+                else:
+                    agent.q_network.load_state_dict(sd)
+                    agent.target_network.load_state_dict(sd)
 
-
-def build_federated_hierarchy(
-    num_vehicles: int,
-    num_rsus: int,
-    agents: List[DQNAgent],
-    clip_C: float,
-    alpha_rdp: float,
-    delta: float,
-    init_eps_vehicle: float,
-    device: str = "cpu",
-) -> Tuple[List[VehicleClient], List[RSUServer], BaseStation]:
-    vehicles = [
-        VehicleClient(
-            vid=i, agent=agents[i],
-            clip_C=clip_C, alpha_rdp=alpha_rdp, delta=delta,
-            init_eps=init_eps_vehicle, device=device,
-            z_init=1.0, z_min=0.5, z_max=2.0,
-            low_eps_threshold=0.2, freeze_when_exhausted=True
-        )
-        for i in range(num_vehicles)
-    ]
-    rsus = [RSUServer(rid=i) for i in range(num_rsus)]
-    bs = BaseStation()
-    return vehicles, rsus, bs
+    def flat_distribute(self, agents: List[DoubleDQNAgent]):
+        """
+        扁平化分发：将全局模型分发给所有 agent（不通过 RSU 层级）
+        处理 Opacus GradSampleModule 包装的情况
+        """
+        if self.global_model is None:
+            return
+        sd = self.global_model.state_dict()
+        for agent in agents:
+            # 如果 q_network 是 Opacus 包装的，需要添加 _module. 前缀
+            if hasattr(agent.q_network, '_module'):
+                sd_with_prefix = {}
+                for k, v in sd.items():
+                    sd_with_prefix[f'_module.{k}'] = v
+                agent.q_network.load_state_dict(sd_with_prefix)
+                # target_network 没有包装，直接加载
+                agent.target_network.load_state_dict(sd)
+            else:
+                agent.q_network.load_state_dict(sd)
+                agent.target_network.load_state_dict(sd)

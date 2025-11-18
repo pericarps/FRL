@@ -1,0 +1,61 @@
+# =============================================================
+# Conda environment for HierFedRL / DDQN training
+# =============================================================
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate hierfedrl
+#
+# To update existing env:
+#   conda env update -f environment.yml --prune
+#
+# To export your current env:
+#   conda env export > environment.yml
+# =============================================================
+
+name: hierfedrl
+
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python>=3.10,<3.12
+  
+  # Core dependencies (available via conda)
+  - pytorch::pytorch>=2.0.0
+  - pytorch::torchvision
+  - pytorch::torchaudio
+  - numpy
+  - networkx
+  - tqdm
+  
+  # Pip-only dependencies (opacus not in conda, tensorboard better from pip)
+  - pip
+  - pip:
+    - opacus>=1.4.0
+    - tensorboard
+    
+  # Optional: Analysis/export scripts (uncomment if needed)
+  # - pandas
+  # - scipy
+  # - scikit-learn
+  # - matplotlib
+  # - seaborn
+
+# =============================================================
+# GPU SUPPORT NOTES:
+# 
+# For CUDA 12.x (GPU training):
+#   The pytorch channel will auto-detect and install CUDA-enabled torch
+#   OR specify explicitly:
+#     - pytorch::pytorch-cuda=12.1
+#
+# For CPU-only (smaller footprint):
+#   - pytorch::cpuonly
+#
+# To verify after install:
+#   conda activate hierfedrl
+#   python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+# =============================================================

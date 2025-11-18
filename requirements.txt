@@ -1,0 +1,40 @@
+# =============================================================
+# Minimal runtime environment for HierFedRL / DDQN training
+# =============================================================
+# Python version (recommended): >=3.10 (3.10 or 3.11 tested best with Torch 2.x)
+#
+# Core training dependencies (KEEP):
+# - torch: neural networks, tensor ops, includes torch.utils.tensorboard interface
+# - numpy: numerical operations
+# - tqdm: progress bars in training loops
+# - networkx: DAG generation and manipulation in dag.py
+# - opacus: currently enforced import in agent.py (PrivacyEngine); remove import to drop this
+# - tensorboard: event file visualization (SummaryWriter writes logs, needs tensorboard installed to view)
+#
+# Optional analysis / export scripts (COMMENTED OUT below):
+# - pandas, scipy, scikit-learn, matplotlib, seaborn: used only in analysis/export scripts (quick_export_plot.py, analyze_training_sigma.py, export_tensorboard_data.py)
+# If you plan to run ONLY train.py for cloud experiments you can omit them.
+# =============================================================
+
+# ---- Core ----
+torch
+numpy
+tqdm
+networkx
+opacus>=1.4.0
+tensorboard
+
+# ---- Optional analysis (uncomment if needed) ----
+# pandas
+# scipy
+# scikit-learn
+# matplotlib
+# seaborn
+
+# =============================================================
+# GPU INSTALL NOTES (Run manually, not encoded here):
+# For CUDA 12.x (example):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# For CPU only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# =============================================================
